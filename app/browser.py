@@ -81,12 +81,6 @@ _STEALTH_INIT_SCRIPT = """(() => {
     Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
   } catch (e) {}
   try {
-    // Playwright 的 UA 覆盖不会同步 userAgentData，留着它反而会和 UA 自相矛盾。
-    if (navigator.userAgentData) {
-      Object.defineProperty(navigator, 'userAgentData', { get: () => undefined });
-    }
-  } catch (e) {}
-  try {
     if (!window.chrome) { window.chrome = {}; }
     if (!window.chrome.runtime) { window.chrome.runtime = {}; }
   } catch (e) {}
@@ -97,6 +91,17 @@ _STEALTH_INIT_SCRIPT = """(() => {
         params && params.name === 'notifications'
           ? Promise.resolve({ state: 'default', onchange: null })
           : originalQuery(params);
+    }
+  } catch (e) {}
+})();"""
+
+# 只在**我们真的改写了 UA** 时才隐藏 navigator.userAgentData。
+# 覆盖 UA 不会同步 userAgentData，留着会自相矛盾；但真实 Chrome 本来就有它，
+# 在没改 UA 的场景（用本机 Chrome 有头运行）删掉反而成了破绽。
+_HIDE_UA_DATA_SCRIPT = """(() => {
+  try {
+    if (navigator.userAgentData) {
+      Object.defineProperty(navigator, 'userAgentData', { get: () => undefined });
     }
   } catch (e) {}
 })();"""
@@ -195,7 +200,7 @@ async def open_douyin(settings: Settings) -> AsyncIterator[BrowserSession]:
             if cookies:
                 await context.add_cookies(cookies)
             page = await context.new_page()
-            await apply_stealth(page)
+            await apply_stealth(page, hide_ua_data=True)
 
         await _warm_up(page)
 
@@ -211,13 +216,18 @@ async def open_douyin(settings: Settings) -> AsyncIterator[BrowserSession]:
             await playwright.stop()
 
 
-async def apply_stealth(page: Page) -> None:
+async def apply_stealth(page: Page, *, hide_ua_data: bool = False) -> None:
     """给页面打上反自动化指纹。
 
     抽成公开函数是为了让自建流程（如 `scripts/login.py` 的扫码登录）也能复用同一套
     伪装，避免登录脚本用一套、正式运行用另一套指纹。
+
+    ``hide_ua_data`` 只在调用方**确实改写了 UA** 时才传 True：此时
+    ``navigator.userAgentData`` 会跟新 UA 矛盾，藏掉比留着自相矛盾好。
     """
     await page.add_init_script(_STEALTH_INIT_SCRIPT)
+    if hide_ua_data:
+        await page.add_init_script(_HIDE_UA_DATA_SCRIPT)
 
 
 async def _spoofed_user_agent(page: Page) -> tuple[str, str] | None:
