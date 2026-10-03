@@ -5,7 +5,7 @@ import pytest
 
 from app.browser import AuthenticationError, RiskControlError, SearchBoxNotReadyError
 from app.config import ConfigError
-from app.douyin import PageOperationError
+from app.douyin import MessageRejectedError, PageOperationError
 from app.errors import (
     ErrorCategory,
     RetryStrategy,
@@ -123,6 +123,23 @@ class TestStopAllTasks:
         """页面操作错误不应该停止所有任务。"""
         exc = PageOperationError("搜索不到目标好友")
         assert should_stop_all_tasks(exc) is False
+
+    def test_message_rejected_is_rate_limited_and_stops_all(self):
+        """消息被服务端拒绝 = 风控命中：必须立即停，且不能当"页面没渲染好"去重试。
+
+        实测：抖音发送接口风控命中时返回 200 + {"decision":"KICK"}，
+        前端渲染成"发送失败，页面提示可以重试"。若按页面错误处理，
+        11 个好友会各发 3 次请求，把风控标记越刷越深。
+        """
+        exc = MessageRejectedError("原生表情“续火花”发送失败，页面提示可以重试")
+        assert classify_error(exc) is ErrorCategory.RATE_LIMIT
+        assert should_stop_all_tasks(exc) is True
+
+    def test_message_rejected_wording_falls_back_to_rate_limit(self):
+        """即使异常类型丢了，文案也要能兜住（防止回归成 PageOperationError）。"""
+        exc = PageOperationError("原生表情“续火花”发送失败，页面提示可以重试")
+        assert classify_error(exc) is ErrorCategory.RATE_LIMIT
+        assert should_stop_all_tasks(exc) is True
 
     def test_network_error_does_not_stop_all(self):
         """网络错误不应该停止所有任务。"""

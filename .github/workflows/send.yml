@@ -31,6 +31,9 @@ jobs:
       WEBHOOK_HEADERS: ${{ secrets.WEBHOOK_HEADERS }}
       WEBHOOK_TEMPLATE: ${{ secrets.WEBHOOK_TEMPLATE }}
       HEADLESS: "true"
+      # 登录页出现时换全新上下文重试的次数（>=1）。风控偶发把 /chat 换登录页时
+      # 重试一次往往能过；设成 1 则完全关闭重试。
+      LOGIN_OPEN_ATTEMPTS: "2"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

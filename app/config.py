@@ -36,6 +36,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         browser_path=_optional_env("BROWSER_PATH"),
         artifacts_dir=artifacts_dir,
         trace=_parse_bool(os.getenv("TRACE", "true"), "TRACE"),
+        login_open_attempts=_parse_positive_int(os.getenv("LOGIN_OPEN_ATTEMPTS", "2"), "LOGIN_OPEN_ATTEMPTS"),
         dingtalk_webhook=dingtalk_webhook,
         dingtalk_secret=dingtalk_secret,
         webhook_url=webhook_url,
@@ -213,6 +214,16 @@ def _parse_bool(value: str, label: str) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ConfigError(f"{label} 必须是 true 或 false")
+
+
+def _parse_positive_int(value: str, label: str) -> int:
+    try:
+        parsed = int(value.strip())
+    except (AttributeError, ValueError) as exc:
+        raise ConfigError(f"{label} 必须是正整数") from exc
+    if parsed < 1:
+        raise ConfigError(f"{label} 必须大于等于 1")
+    return parsed
 
 
 def _non_empty_string(value: Any, label: str) -> str:

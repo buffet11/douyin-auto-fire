@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.models import Message
-from app.douyin import PageOperationError
+from app.douyin import MessageRejectedError, PageOperationError
 from app.selectors import IMAGE_INPUTS
 from app.sender import (
     LATEST_OUTGOING_MESSAGE,
@@ -309,7 +309,13 @@ async def test_sticker_click_retries_via_publish_when_staged(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
-async def test_sticker_click_retries_via_retry_marker_when_failed(monkeypatch) -> None:
+async def test_rejected_sticker_is_not_retried_and_raises(monkeypatch) -> None:
+    """服务端明确拒绝时必须立刻抛出，且**不许**点页面上的重试按钮。
+
+    实测依据：抖音发送接口在风控命中时返回 200 + `{"decision":"KICK"}`，
+    前端渲染成"发送失败，可重试"。此时点重试只会再发一次注定失败的请求
+    （后续请求在传输层直接 ERR_FAILED），并且会继续加深风控标记。
+    """
     item = MagicMock()
     item.get_attribute = AsyncMock(return_value=None)
     item.click = AsyncMock()
@@ -337,9 +343,7 @@ async def test_sticker_click_retries_via_retry_marker_when_failed(monkeypatch) -
 
     async def fake_confirm(_page, _before, _name, _key=""):
         calls["confirm"] += 1
-        if calls["confirm"] == 1:
-            raise PageOperationError("发送失败，页面提示可以重试")
-        return None
+        raise MessageRejectedError("发送失败，页面提示可以重试")
 
     async def fake_trigger(_page):
         calls["publish"] += 1
@@ -351,11 +355,50 @@ async def test_sticker_click_retries_via_retry_marker_when_failed(monkeypatch) -
     monkeypatch.setattr("app.sender._trigger_send", fake_trigger)
     monkeypatch.setattr("app.sender._publish_ready", fake_ready)
 
+    with pytest.raises(MessageRejectedError, match="发送失败"):
+        await _click_and_confirm_sticker(page, item, ("anchor", "old"), "比心")
+
+    assert calls["confirm"] == 1, "被拒绝后不应再确认一次"
+    assert calls["publish"] == 0
+    marker.click.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sticker_click_resends_when_staged_not_sent(monkeypatch) -> None:
+    """非"被拒绝"的失败（表情进了输入框没触发发送）仍然补一次发送。"""
+    item = MagicMock()
+    item.get_attribute = AsyncMock(return_value=None)
+    item.click = AsyncMock()
+    img_first = MagicMock()
+    img_first.count = AsyncMock(return_value=0)
+    img_loc = MagicMock()
+    img_loc.first = img_first
+    item.locator.return_value = img_loc
+
+    page = MagicMock()
+
+    calls = {"confirm": 0, "publish": 0}
+
+    async def fake_confirm(_page, _before, _name, _key=""):
+        calls["confirm"] += 1
+        if calls["confirm"] == 1:
+            raise PageOperationError("图片已发送，但没有检测到新的已发送消息")
+        return None
+
+    async def fake_trigger(_page):
+        calls["publish"] += 1
+
+    async def fake_ready(_page):
+        return True
+
+    monkeypatch.setattr("app.sender._confirm_sticker_sent", fake_confirm)
+    monkeypatch.setattr("app.sender._trigger_send", fake_trigger)
+    monkeypatch.setattr("app.sender._publish_ready", fake_ready)
+
     await _click_and_confirm_sticker(page, item, ("anchor", "old"), "比心")
 
     assert calls["confirm"] == 2
-    assert calls["publish"] == 0
-    marker.click.assert_awaited_once_with(force=True)
+    assert calls["publish"] == 1
 
 
 @pytest.mark.asyncio

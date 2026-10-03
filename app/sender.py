@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 from playwright.async_api import Locator, Page
 
-from app.douyin import DouyinChat, PageOperationError, first_visible
+from app.douyin import DouyinChat, MessageRejectedError, PageOperationError, first_visible
 from app.models import Message, Sticker
 from app.selectors import IMAGE_INPUTS, MESSAGE_INPUTS, STICKER_BUTTONS, STICKER_PANELS
 
@@ -90,6 +90,9 @@ SEND_PENDING_MARKERS = (
     '[class*="im-saas-message-spin"]',
     '[data-icon="spin"]',
 )
+# 失败标记里"可重试"的那一类。它代表**服务端拒绝了这条消息**，而不是页面没渲染好，
+# 所以不再对它做自动重试（见 MessageRejectedError）。这里单独导出，供测试钉住
+# "出现该标记时不会去点重试按钮"这条契约。
 SEND_RETRY_MARKERS = (
     '[aria-label*="重试"]',
     '[title*="重试"]',
@@ -278,10 +281,13 @@ async def _click_and_confirm_sticker(page: Page, item, before: tuple[str, str], 
     await item.click(force=True)
     try:
         await _confirm_sticker_sent(page, before, name, resource_key)
-    except PageOperationError as exc:
-        if "页面提示可以重试" in str(exc) and await _click_retry_on_latest_failed_message(page):
-            await _confirm_sticker_sent(page, before, name, resource_key)
-            return
+    except MessageRejectedError:
+        # 服务端已经明确拒绝（风控判定，见 MessageRejectedError 的说明）。
+        # 这里**不点重试**：实测重试请求会在传输层直接失败（net::ERR_FAILED），
+        # 既救不回来，又会让风控标记更深。直接往上抛，由 main 停止整轮任务。
+        raise
+    except PageOperationError:
+        # 非"被拒绝"的失败（例如表情进了输入框但没触发发送）：补一次发送再确认。
         if await _publish_ready(page):
             await _trigger_send(page)
             await _confirm_sticker_sent(page, before, name, resource_key)
@@ -307,19 +313,6 @@ async def _confirm_sticker_sent(
     resource_key: str = "",
 ) -> None:
     await _confirm_outgoing_message(page, before, f"原生表情“{name}”", resource_key=resource_key)
-
-
-async def _click_retry_on_latest_failed_message(page: Page) -> bool:
-    latest = page.locator(LATEST_OUTGOING_MESSAGE).first
-    for selector in SEND_RETRY_MARKERS:
-        marker = latest.locator(selector).first
-        try:
-            if await marker.count() and await marker.is_visible():
-                await marker.click(force=True)
-                return True
-        except Exception:
-            continue
-    return False
 
 
 async def _marker_visible(scope: Locator, selectors: tuple[str, ...]) -> bool:
@@ -387,7 +380,7 @@ async def _await_send_terminal_state(
                 f"{label}发送状态未能确认（发送超时或状态不确定），为避免重复不会自动重试"
             )
         if await _marker_visible(scope, SEND_FAILURE_MARKERS):
-            raise PageOperationError(f"{label}发送失败，页面提示可以重试")
+            raise MessageRejectedError(f"{label}发送失败，页面提示可以重试")
         if await _marker_visible(scope, SEND_PENDING_MARKERS):
             break  # -> resolve pending in Phase 2
         await page.wait_for_timeout(SEND_POLL_INTERVAL_MS)
@@ -403,13 +396,13 @@ async def _await_send_terminal_state(
                 f"{label}发送状态未能确认（发送超时或状态不确定），为避免重复不会自动重试"
             )
         if await _marker_visible(scope, SEND_FAILURE_MARKERS):
-            raise PageOperationError(f"{label}发送失败，页面提示可以重试")
+            raise MessageRejectedError(f"{label}发送失败，页面提示可以重试")
         if not await _marker_visible(scope, SEND_PENDING_MARKERS):
             # Spinner gone. Require it to STAY clear across the stable window --
             # the retry marker can mount a tick after the spinner disappears.
             await page.wait_for_timeout(SEND_STABLE_INTERVAL_MS)
             if await _marker_visible(scope, SEND_FAILURE_MARKERS):
-                raise PageOperationError(f"{label}发送失败，页面提示可以重试")
+                raise MessageRejectedError(f"{label}发送失败，页面提示可以重试")
             if not await _marker_visible(scope, SEND_PENDING_MARKERS):
                 return  # terminal: success
             # spinner reappeared -> keep waiting

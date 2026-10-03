@@ -102,6 +102,93 @@ async def test_browser_start_failure_still_notifies(monkeypatch, tmp_path) -> No
 
 
 @pytest.mark.asyncio
+async def test_login_stage_failure_is_retried_with_fresh_context(monkeypatch, tmp_path) -> None:
+    """登录页导致的失败要整轮重试（换全新浏览器上下文），第二次成功即算成功。"""
+    settings = _settings(tmp_path)
+    task = _task()
+    page = MagicMock()
+    session = SimpleNamespace(page=page, context=MagicMock())
+    opens: list[int] = []
+
+    @asynccontextmanager
+    async def fake_open_douyin(_settings):
+        opens.append(len(opens) + 1)
+        yield session
+
+    async def fake_open_private_messages(_page) -> None:
+        if len(opens) == 1:
+            raise AuthenticationError("进入抖音私信页面后登录状态失效")
+
+    history = MagicMock()
+    history.run_date.return_value = "2026-08-09"
+    chat = MagicMock()
+    chat.open_target = AsyncMock()
+    notify = AsyncMock()
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(main_module, "load_settings", lambda _env=None: settings)
+    monkeypatch.setattr(main_module, "load_task", lambda _settings: task)
+    monkeypatch.setattr(main_module, "History", MagicMock(return_value=history))
+    monkeypatch.setattr(main_module, "open_douyin", fake_open_douyin)
+    monkeypatch.setattr(main_module, "open_private_messages", fake_open_private_messages)
+    monkeypatch.setattr(main_module, "DouyinChat", MagicMock(return_value=chat))
+    monkeypatch.setattr(main_module, "verify_login", AsyncMock())
+    monkeypatch.setattr(main_module, "send_message", AsyncMock())
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(main_module, "_screenshot", AsyncMock(return_value=None))
+    monkeypatch.setattr(main_module, "_write_results", MagicMock())
+    monkeypatch.setattr(main_module, "_notify_dingtalk", notify)
+    monkeypatch.setattr(main_module, "_configure_logging", lambda _path, _aliases=None: None)
+
+    assert await main_module.run() == 0
+    assert len(opens) == 2, "登录阶段失败后应换一个全新上下文重试"
+    assert sleeps[0] == main_module.LOGIN_RETRY_DELAY_SECONDS
+    # 第一轮的失败结果不能带到最终报告里
+    results = notify.await_args.args[3]
+    assert [result.status for result in results] == ["success", "success"]
+
+
+@pytest.mark.asyncio
+async def test_send_stage_failure_is_never_retried(monkeypatch, tmp_path) -> None:
+    """已经开始处理好友之后的登录失效绝不重试 —— 否则会重复发消息。"""
+    settings = _settings(tmp_path)
+    page = MagicMock()
+    session = SimpleNamespace(page=page, context=MagicMock())
+    opens: list[int] = []
+
+    @asynccontextmanager
+    async def fake_open_douyin(_settings):
+        opens.append(len(opens) + 1)
+        yield session
+
+    history = MagicMock()
+    history.run_date.return_value = "2026-08-09"
+    chat = MagicMock()
+    chat.open_target = AsyncMock()
+
+    monkeypatch.setattr(main_module, "load_settings", lambda _env=None: settings)
+    monkeypatch.setattr(main_module, "load_task", lambda _settings: _task())
+    monkeypatch.setattr(main_module, "History", MagicMock(return_value=history))
+    monkeypatch.setattr(main_module, "open_douyin", fake_open_douyin)
+    monkeypatch.setattr(main_module, "open_private_messages", AsyncMock())
+    monkeypatch.setattr(main_module, "DouyinChat", MagicMock(return_value=chat))
+    monkeypatch.setattr(main_module, "verify_login", AsyncMock(side_effect=AuthenticationError("登录失效")))
+    monkeypatch.setattr(main_module, "_screenshot", AsyncMock(return_value=None))
+    monkeypatch.setattr(main_module, "_write_results", MagicMock())
+    monkeypatch.setattr(main_module, "_notify_dingtalk", AsyncMock())
+    monkeypatch.setattr(main_module, "_configure_logging", lambda _path, _aliases=None: None)
+
+    with pytest.raises(AuthenticationError, match="登录失效"):
+        await main_module.run()
+
+    chat.open_target.assert_awaited_once_with("好友A", retries=0)
+    assert len(opens) == 1
+
+
+@pytest.mark.asyncio
 async def test_waits_between_consecutive_messages_for_same_friend(monkeypatch, tmp_path) -> None:
     settings = _settings(tmp_path)
     messages = (Message(type="text", content="一"), Message(type="text", content="二"))

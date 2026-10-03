@@ -12,6 +12,19 @@ class PageOperationError(RuntimeError):
     pass
 
 
+class MessageRejectedError(PageOperationError):
+    """消息被服务端明确拒绝（而不是页面没渲染好）。
+
+    实测：抖音私信发送接口 `imapi.douyin.com/v1/message/send` 在风控命中时
+    会返回 HTTP 200 + body `{"decision":"KICK"}`，前端把这个结果渲染成
+    "发送失败，可重试" 的红色标记。此时**再点重试是有害的**：后续请求会
+    在传输层直接失败（`net::ERR_FAILED`），并且会继续加深风控标记。
+
+    所以这类失败必须与"DOM 变了/渲染慢"区分开：不重试、不继续下一个好友，
+    立刻停止整轮任务。
+    """
+
+
 RETRY_DELAY_MS = 3_000
 
 

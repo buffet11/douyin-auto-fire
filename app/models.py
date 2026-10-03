@@ -54,6 +54,9 @@ class Settings:
     browser_path: str | None
     artifacts_dir: Path
     trace: bool
+    # 登录阶段（开浏览器 + 进私信页）失败时，换全新上下文重试的总次数。
+    # 只对 AuthenticationError 生效，且只在尚未开始处理好友时重试。
+    login_open_attempts: int = 2
     dingtalk_webhook: str | None = None
     dingtalk_secret: str | None = None
     webhook_url: str | None = None

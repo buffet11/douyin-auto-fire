@@ -11,6 +11,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from playwright.async_api import async_playwright
 
+from app.browser import (
+    AuthenticationError,
+    RiskControlError,
+    SearchBoxNotReadyError,
+    open_private_messages,
+)
+
 
 DOUYIN_URL = "https://www.douyin.com/"
 
@@ -25,10 +32,14 @@ async def login() -> None:
         await asyncio.to_thread(input)
         await page.goto(DOUYIN_URL, wait_until="domcontentloaded")
         await _verify_home_login(page)
+        # 首页能看 ≠ 私信页能用：抖音对私信页的登录校验更严，只验首页会导出一份
+        # "看着登上了、跑起来却报登录失效"的登录态。这里必须真进一次私信页。
+        await _verify_chat_login(page)
         await context.storage_state(path="storage-state.json.tmp")
         await browser.close()
         Path("storage-state.json.tmp").replace("storage-state.json")
         print("登录状态已保存到 storage-state.json")
+        print("把该文件的完整内容填进 GitHub Secret DOUYIN_STORAGE_STATE 即可（比纯 Cookie 更稳）。")
 
 
 async def _open_login(page) -> None:
@@ -51,6 +62,15 @@ async def _verify_home_login(page) -> None:
     login = page.get_by_text("登录", exact=True)
     if await login.count() and await login.first.is_visible():
         raise RuntimeError("未检测到登录成功，请重新运行并完成扫码确认")
+
+
+async def _verify_chat_login(page) -> None:
+    """确认这份登录态真的能进私信页（搜索框可见）。"""
+    try:
+        await open_private_messages(page)
+    except (AuthenticationError, RiskControlError, SearchBoxNotReadyError) as exc:
+        raise RuntimeError(f"登录态无法进入抖音私信页，请重新登录后再试: {exc}") from exc
+    print("已确认可以进入私信页（好友搜索框可见）。")
 
 
 if __name__ == "__main__":

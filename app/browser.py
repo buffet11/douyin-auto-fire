@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from app.config import ConfigError, parse_auth_json
 from app.models import Settings
 from app.selectors import (
     DOUYIN_CHAT_URL,
+    DOUYIN_HOME_URL,
     LOGIN_MARKERS,
     LOGIN_REQUIRED_MARKERS,
     RISK_MARKERS,
@@ -40,6 +42,75 @@ class SearchBoxNotReadyError(RuntimeError):
 # 单轮等待窗口。这里做有限次数重试，并在需要时 reload，避免把慢渲染误判为认证失效。
 SEARCH_BOX_RETRIES = 3
 _SEARCH_RETRY_DELAY_MS = 1_500
+
+# 进私信页前先访问首页并稍作停留，让站点种下 ttwid / s_v_web_id 之类的指纹值。
+WARM_UP_SETTLE_MS = 4_000
+_WARM_UP_NAV_TIMEOUT_MS = 45_000
+
+# 关掉 Chromium 的自动化开关，避免 navigator.webdriver 等特征把无头浏览器
+# 直接暴露给抖音风控（无头模式下被判定为脚本是最常见的"登录态失效"来源）。
+_LAUNCH_ARGS = (
+    "--disable-blink-features=AutomationControlled",
+    "--disable-infobars",
+    "--no-first-run",
+    "--no-default-browser-check",
+)
+
+# 无头 UA 会被替换成同版本的常规 Windows Chrome UA。
+# 实测证据：CI 上抓到的请求里，User-Agent 和 sec-ch-ua 都写着
+# `HeadlessChrome/153.0.8010.12`，而且前端还会把 navigator.userAgent /
+# navigator.platform 当成参数**上报进发送请求体**（browser_version /
+# browser_platform / user_agent 字段）——服务端一眼就能看出是无头机器人。
+# 所以这里三处要一起改，保持一致：HTTP UA、client hints、navigator.platform。
+_UA_WINDOWS_TEMPLATE = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/{version} Safari/537.36"
+)
+_UA_VERSION_RE = re.compile(r"HeadlessChrome/(\d+(?:\.\d+)*)")
+
+# 在页面脚本执行前抹掉最明显的自动化指纹。只做无副作用的覆盖，
+# 不改写任何业务对象，避免干扰抖音自身的前端逻辑。
+_STEALTH_INIT_SCRIPT = """(() => {
+  try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  } catch (e) {}
+  try {
+    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh'] });
+  } catch (e) {}
+  try {
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+  } catch (e) {}
+  try {
+    // Playwright 的 UA 覆盖不会同步 userAgentData，留着它反而会和 UA 自相矛盾。
+    if (navigator.userAgentData) {
+      Object.defineProperty(navigator, 'userAgentData', { get: () => undefined });
+    }
+  } catch (e) {}
+  try {
+    if (!window.chrome) { window.chrome = {}; }
+    if (!window.chrome.runtime) { window.chrome.runtime = {}; }
+  } catch (e) {}
+  try {
+    if (navigator.permissions && navigator.permissions.query) {
+      const originalQuery = navigator.permissions.query.bind(navigator.permissions);
+      navigator.permissions.query = (params) =>
+        params && params.name === 'notifications'
+          ? Promise.resolve({ state: 'default', onchange: null })
+          : originalQuery(params);
+    }
+  } catch (e) {}
+})();"""
+
+
+def _client_hint_headers(version: str) -> dict[str, str]:
+    """按伪装后的 Chrome 版本拼一套自洽的 client hints。"""
+    major = version.split(".")[0] or version
+    return {
+        "sec-ch-ua": f'"Google Chrome";v="{major}", "Chromium";v="{major}", "Not_A Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
 
 
 # Collects only safe, whitelisted attributes. It deliberately reads no
@@ -77,25 +148,57 @@ async def open_douyin(settings: Settings) -> AsyncIterator[BrowserSession]:
     context: BrowserContext | None = None
     try:
         playwright = await async_playwright().start()
-        launch_args = {"headless": settings.headless}
+        launch_args: dict[str, Any] = {
+            "headless": settings.headless,
+            "args": list(_LAUNCH_ARGS),
+        }
         if settings.browser_path:
             launch_args["executable_path"] = settings.browser_path
         browser = await playwright.chromium.launch(**launch_args)
 
-        context_args = {"viewport": {"width": 1440, "height": 1000}, "locale": "zh-CN"}
+        context_args: dict[str, Any] = {
+            "viewport": {"width": 1440, "height": 1000},
+            "locale": "zh-CN",
+            "timezone_id": "Asia/Shanghai",
+            "extra_http_headers": {"Accept-Language": "zh-CN,zh;q=0.9"},
+        }
         if settings.storage_state:
             state = parse_auth_json(settings.storage_state, "DOUYIN_STORAGE_STATE")
             if not isinstance(state, dict):
                 raise ConfigError("DOUYIN_STORAGE_STATE 必须是 JSON 对象")
             context_args["storage_state"] = state
         context = await browser.new_context(**context_args)
+
+        cookies: list[dict[str, Any]] = []
         if not settings.storage_state and settings.cookie:
-            cookies = parse_auth_json(settings.cookie, "DOUYIN_COOKIE")
-            if not isinstance(cookies, list):
+            raw_cookies = parse_auth_json(settings.cookie, "DOUYIN_COOKIE")
+            if not isinstance(raw_cookies, list):
                 raise ConfigError("DOUYIN_COOKIE 必须是 Cookie 数组")
-            await context.add_cookies(_normalize_cookies(cookies))
+            cookies = _normalize_cookies(raw_cookies)
+            await context.add_cookies(cookies)
 
         page = await context.new_page()
+        await page.add_init_script(_STEALTH_INIT_SCRIPT)
+
+        # 无头 Chromium 默认 UA 里带 "HeadlessChrome"，是最容易被风控识别的
+        # 特征之一。这里不猜版本号：从真实页面读一次 UA，取出其中的 Chrome 版本，
+        # 换成同版本的常规 Windows Chrome UA 重建 context —— UA、client hints、
+        # navigator.platform 三者保持一致，不留自相矛盾的破绽。
+        spoofed = await _spoofed_user_agent(page)
+        if spoofed is not None:
+            user_agent, version = spoofed
+            LOGGER.info("检测到无头 UA，改用同版本常规 Windows Chrome UA 重建上下文")
+            await context.close()
+            context_args["user_agent"] = user_agent
+            context_args.setdefault("extra_http_headers", {}).update(_client_hint_headers(version))
+            context = await browser.new_context(**context_args)
+            if cookies:
+                await context.add_cookies(cookies)
+            page = await context.new_page()
+            await page.add_init_script(_STEALTH_INIT_SCRIPT)
+
+        await _warm_up(page)
+
         if settings.trace:
             await context.tracing.start(screenshots=True, snapshots=True, sources=False)
         yield BrowserSession(page=page, context=context)
@@ -106,6 +209,35 @@ async def open_douyin(settings: Settings) -> AsyncIterator[BrowserSession]:
             await browser.close()
         if playwright:
             await playwright.stop()
+
+
+async def _spoofed_user_agent(page: Page) -> tuple[str, str] | None:
+    """无头 UA 就返回 (去掉 Headless 标记的 Windows Chrome UA, 版本号)，否则 None。"""
+    try:
+        user_agent = await page.evaluate("() => navigator.userAgent")
+    except Exception:
+        return None
+    if not isinstance(user_agent, str):
+        return None
+    match = _UA_VERSION_RE.search(user_agent)
+    if match is None:
+        return None
+    version = match.group(1)
+    return _UA_WINDOWS_TEMPLATE.format(version=version), version
+
+
+async def _warm_up(page: Page) -> None:
+    """进入私信页之前先访问一次首页。
+
+    直接冷启动打 /chat 时，抖音的前端还没在本地种下 ttwid / s_v_web_id
+    这类指纹值，容易被服务端按"未登录"处理（表现为 /chat 渲染出登录页）。
+    预热失败不致命：只记日志，后续照常访问私信页。
+    """
+    try:
+        await page.goto(DOUYIN_HOME_URL, wait_until="domcontentloaded", timeout=_WARM_UP_NAV_TIMEOUT_MS)
+        await page.wait_for_timeout(WARM_UP_SETTLE_MS)
+    except Exception:
+        LOGGER.warning("预热访问抖音首页失败，直接进入私信页", exc_info=True)
 
 
 async def verify_login(page: Page, timeout_ms: int = 15_000) -> None:
@@ -126,6 +258,7 @@ async def open_private_messages(page: Page, timeout_ms: int = 15_000) -> None:
     #    expired credentials. Marker absence does not imply the credentials are
     #    valid, so search-box detection (steps 3/4) is kept separate.
     if await _any_visible(page, LOGIN_REQUIRED_MARKERS, timeout_ms=2_000):
+        await _log_login_diagnostic(page, "进入私信页即发现登录页")
         raise AuthenticationError("进入抖音私信页面后登录状态失效")
 
     # 3. Detect the friend search box. The chat page is a SPA whose search box is
@@ -143,6 +276,7 @@ async def open_private_messages(page: Page, timeout_ms: int = 15_000) -> None:
         if await _any_visible(page, RISK_MARKERS, timeout_ms=2_000):
             raise RiskControlError("抖音私信页面要求进行安全验证，任务已停止")
         if await _any_visible(page, LOGIN_REQUIRED_MARKERS, timeout_ms=2_000):
+            await _log_login_diagnostic(page, "等待搜索框期间出现登录页")
             raise AuthenticationError("进入抖音私信页面后登录状态失效")
         if attempt < SEARCH_BOX_RETRIES:
             LOGGER.warning("未检测到好友搜索框，第 %d/%d 次尝试，准备重试", attempt, SEARCH_BOX_RETRIES)
@@ -168,6 +302,20 @@ async def open_private_messages(page: Page, timeout_ms: int = 15_000) -> None:
 async def save_trace(session: BrowserSession, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     await session.context.tracing.stop(path=path)
+
+
+async def _log_login_diagnostic(page: Page, reason: str) -> None:
+    """登录页出现时把页面安全诊断写进日志。
+
+    原来只有"搜索框始终没出现"才会打诊断，而"确实被换成登录页"这条路径
+    什么都不留 —— 结果 CI 里只能看到一行"登录状态失效"，无法判断是 Cookie
+    真过期、还是被风控拦了。这里补上诊断，且任何失败都不得影响主流程判断。
+    """
+    try:
+        diagnostic = await _collect_safe_diagnostic(page, LOGIN_REQUIRED_MARKERS, RISK_MARKERS)
+        LOGGER.error("%s，页面安全诊断:\n%s", reason, diagnostic)
+    except Exception:
+        LOGGER.debug("收集登录失败诊断时出错，已忽略", exc_info=True)
 
 
 async def _any_visible(page: Page, selectors: tuple[str, ...], timeout_ms: int) -> bool:

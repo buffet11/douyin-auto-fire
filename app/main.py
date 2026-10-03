@@ -11,6 +11,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from app.browser import AuthenticationError, RiskControlError, SearchBoxNotReadyError, open_douyin, open_private_messages, save_trace, verify_login
 from app.config import ConfigError, load_settings, load_task
@@ -18,7 +19,7 @@ from app.douyin import DouyinChat, PageOperationError
 from app.errors import classify_error, get_retry_strategy, should_stop_all_tasks
 from app.history import AlreadyRunningError, History, run_lock
 from app.metrics import Metrics, HistoricalMetrics, format_metrics_summary
-from app.models import Settings, TargetResult
+from app.models import Settings, TargetResult, TaskConfig
 from app.notifier import send_dingtalk_notification, send_webhook_notification
 from app.privacy import RedactingFormatter, build_target_aliases, redact_text, target_alias
 from app.progress import create_single_run_progress
@@ -26,6 +27,9 @@ from app.sender import send_message
 
 
 LOGGER = logging.getLogger("douyin_sender")
+
+# 登录阶段重试前的等待时间：给抖音风控一点缓冲，也避免连续劈头盖脸打登录接口。
+LOGIN_RETRY_DELAY_SECONDS = 20.0
 
 
 async def run(dry_run: bool = False, env_file: str | None = None) -> int:
@@ -38,6 +42,68 @@ async def run(dry_run: bool = False, env_file: str | None = None) -> int:
     if not settings.storage_state and not settings.cookie:
         raise ConfigError("必须配置 DOUYIN_STORAGE_STATE 或 DOUYIN_COOKIE")
 
+    history = History(settings.artifacts_dir / "history.json")
+    run_date = history.run_date(task.timezone)
+
+    # 登录阶段（开浏览器 + 进私信页）失败时整轮重试：抖音在机房 IP / 无头浏览器下
+    # 偶发地直接把 /chat 换成登录页，同一次任务换个全新浏览器上下文往往能过。
+    # 严格限制：只有"还没开始处理任何好友"时才会重试，绝不重放已经发出的消息。
+    attempts = max(1, settings.login_open_attempts)
+    outcomes: dict[str, Any] = {}
+    for attempt in range(1, attempts + 1):
+        outcomes = await _run_once(settings, task, history, run_date, dry_run, aliases)
+        if not outcomes["login_stage_failed"] or attempt >= attempts:
+            break
+        LOGGER.warning(
+            "登录状态检测失败（第 %d/%d 次），%.0f 秒后换全新浏览器上下文重试",
+            attempt,
+            attempts,
+            LOGIN_RETRY_DELAY_SECONDS,
+        )
+        await asyncio.sleep(LOGIN_RETRY_DELAY_SECONDS)
+
+    metrics: Metrics = outcomes["metrics"]
+    results: list[TargetResult] = outcomes["results"]
+    screenshots: list[Path] = outcomes["screenshots"]
+    fatal_error: Exception | None = outcomes["fatal_error"]
+    start_time: float = outcomes["start_time"]
+
+    # 完成指标统计
+    metrics.total_duration_seconds = time.time() - start_time
+    metrics.finalize()
+
+    # 保存指标
+    metrics.save(settings.artifacts_dir / "metrics.json")
+
+    # 更新历史指标
+    historical = HistoricalMetrics.load(settings.artifacts_dir / "metrics_history.json")
+    historical.update(metrics)
+    historical.save(settings.artifacts_dir / "metrics_history.json")
+
+    # 输出指标摘要
+    LOGGER.info("\n%s", format_metrics_summary(metrics))
+
+    _write_results(settings.artifacts_dir, task.task_id, dry_run, results, aliases)
+    await _notify_dingtalk(settings, task.task_id, dry_run, results, screenshots)
+    await _notify_webhook(settings, task.task_id, dry_run, results, screenshots)
+    succeeded = sum(result.status == "success" for result in results)
+    failed = sum(result.status == "failed" for result in results)
+    LOGGER.info("执行结束: 成功 %d，失败 %d", succeeded, failed)
+
+    if fatal_error is not None:
+        raise fatal_error
+    return 1 if failed else 0
+
+
+async def _run_once(
+    settings: Settings,
+    task: TaskConfig,
+    history: History,
+    run_date: str,
+    dry_run: bool,
+    aliases: dict[str, str],
+) -> dict[str, Any]:
+    """执行一轮完整任务，返回本轮结果供 run() 决定是否重试。"""
     # 初始化监控指标
     metrics = Metrics()
     metrics.started_at = datetime.now().astimezone().isoformat()
@@ -46,18 +112,17 @@ async def run(dry_run: bool = False, env_file: str | None = None) -> int:
     # 初始化进度显示
     multi_stage, target_progress = create_single_run_progress(len(task.targets))
 
-    history = History(settings.artifacts_dir / "history.json")
-    run_date = history.run_date(task.timezone)
     results: list[TargetResult] = []
     screenshots: list[Path] = []
     fatal_error: Exception | None = None
+    login_stage_failed = False
+    trace_saved = False
 
     try:
         # 阶段1: 打开浏览器
         multi_stage.start_stage(0)
         async with open_douyin(settings) as session:
             page = session.page
-            trace_saved = False
             multi_stage.finish_stage()
 
             # 阶段2: 验证登录
@@ -68,6 +133,8 @@ async def run(dry_run: bool = False, env_file: str | None = None) -> int:
             except Exception as exc:
                 multi_stage.finish_stage()
                 LOGGER.exception("打开抖音私信页面失败")
+                # 只有"确定是登录态问题"才值得整轮重试；渲染慢、超时等不算。
+                login_stage_failed = isinstance(exc, AuthenticationError)
                 screenshot = await _screenshot(page, settings.artifacts_dir, "login")
                 if screenshot:
                     screenshots.append(screenshot)
@@ -204,31 +271,14 @@ async def run(dry_run: bool = False, env_file: str | None = None) -> int:
             results.append(TargetResult(target="运行检查", status="failed", error=str(exc)))
             metrics.record_target_failure(type(exc).__name__)
 
-    # 完成指标统计
-    metrics.total_duration_seconds = time.time() - start_time
-    metrics.finalize()
-
-    # 保存指标
-    metrics.save(settings.artifacts_dir / "metrics.json")
-
-    # 更新历史指标
-    historical = HistoricalMetrics.load(settings.artifacts_dir / "metrics_history.json")
-    historical.update(metrics)
-    historical.save(settings.artifacts_dir / "metrics_history.json")
-
-    # 输出指标摘要
-    LOGGER.info("\n%s", format_metrics_summary(metrics))
-
-    _write_results(settings.artifacts_dir, task.task_id, dry_run, results, aliases)
-    await _notify_dingtalk(settings, task.task_id, dry_run, results, screenshots)
-    await _notify_webhook(settings, task.task_id, dry_run, results, screenshots)
-    succeeded = sum(result.status == "success" for result in results)
-    failed = sum(result.status == "failed" for result in results)
-    LOGGER.info("执行结束: 成功 %d，失败 %d", succeeded, failed)
-
-    if fatal_error is not None:
-        raise fatal_error
-    return 1 if failed else 0
+    return {
+        "metrics": metrics,
+        "results": results,
+        "screenshots": screenshots,
+        "fatal_error": fatal_error,
+        "start_time": start_time,
+        "login_stage_failed": login_stage_failed,
+    }
 
 
 def main() -> int:

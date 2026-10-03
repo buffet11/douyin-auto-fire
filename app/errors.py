@@ -54,7 +54,7 @@ def classify_error(exc: Exception) -> ErrorCategory:
         错误类别
     """
     from app.browser import AuthenticationError, RiskControlError, SearchBoxNotReadyError
-    from app.douyin import PageOperationError
+    from app.douyin import MessageRejectedError, PageOperationError
     from app.config import ConfigError
 
     # 认证失效 - 立即停止
@@ -65,11 +65,22 @@ def classify_error(exc: Exception) -> ErrorCategory:
     if isinstance(exc, RiskControlError):
         return ErrorCategory.RATE_LIMIT
 
+    # 消息被服务端明确拒绝（风控判定，如 imapi 返回 decision=KICK）
+    # 必须排在 PageOperationError 之前：它是 PageOperationError 的子类。
+    if isinstance(exc, MessageRejectedError):
+        return ErrorCategory.RATE_LIMIT
+
     # 配置错误 - 永久性错误
     if isinstance(exc, ConfigError):
         return ErrorCategory.PERMANENT
 
     error_msg = str(exc).lower()
+
+    # 文案兜底：即使异常类型漏了，发送被拒也不能当成"页面没渲染好"去重试。
+    if any(keyword in error_msg for keyword in [
+        "发送失败", "页面提示可以重试", "被拒绝", "decision",
+    ]):
+        return ErrorCategory.RATE_LIMIT
 
     # 好友不存在 - 永久性错误
     if any(keyword in error_msg for keyword in [
