@@ -178,7 +178,7 @@ async def open_douyin(settings: Settings) -> AsyncIterator[BrowserSession]:
             await context.add_cookies(cookies)
 
         page = await context.new_page()
-        await page.add_init_script(_STEALTH_INIT_SCRIPT)
+        await apply_stealth(page)
 
         # 无头 Chromium 默认 UA 里带 "HeadlessChrome"，是最容易被风控识别的
         # 特征之一。这里不猜版本号：从真实页面读一次 UA，取出其中的 Chrome 版本，
@@ -195,7 +195,7 @@ async def open_douyin(settings: Settings) -> AsyncIterator[BrowserSession]:
             if cookies:
                 await context.add_cookies(cookies)
             page = await context.new_page()
-            await page.add_init_script(_STEALTH_INIT_SCRIPT)
+            await apply_stealth(page)
 
         await _warm_up(page)
 
@@ -209,6 +209,15 @@ async def open_douyin(settings: Settings) -> AsyncIterator[BrowserSession]:
             await browser.close()
         if playwright:
             await playwright.stop()
+
+
+async def apply_stealth(page: Page) -> None:
+    """给页面打上反自动化指纹。
+
+    抽成公开函数是为了让自建流程（如 `scripts/login.py` 的扫码登录）也能复用同一套
+    伪装，避免登录脚本用一套、正式运行用另一套指纹。
+    """
+    await page.add_init_script(_STEALTH_INIT_SCRIPT)
 
 
 async def _spoofed_user_agent(page: Page) -> tuple[str, str] | None:

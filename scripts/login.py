@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -9,23 +10,44 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
 from app.browser import (
     AuthenticationError,
     RiskControlError,
     SearchBoxNotReadyError,
+    apply_stealth,
     open_private_messages,
 )
 
 
 DOUYIN_URL = "https://www.douyin.com/"
 
+def _browser_path() -> str | None:
+    """本机装了 Chrome / Edge 时直接用它，省掉 150MB 的 Chromium 下载。
+
+    与 `run.py` 共用同一个 `BROWSER_PATH` 环境变量（`.env` 或系统环境变量都认），
+    而且用真实的 Chrome 比 Playwright 自带 Chromium 的指纹更自然。
+    """
+    load_dotenv()
+    value = os.getenv("BROWSER_PATH")
+    return value.strip() if value and value.strip() else None
+
+
 async def login() -> None:
+    browser_path = _browser_path()
+    launch_args: dict = {"headless": False}
+    if browser_path:
+        launch_args["executable_path"] = browser_path
+        print(f"使用本机浏览器: {browser_path}")
+    else:
+        print("未配置 BROWSER_PATH，使用 Playwright 自带 Chromium")
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=False)
+        browser = await playwright.chromium.launch(**launch_args)
         context = await browser.new_context(locale="zh-CN")
         page = await context.new_page()
+        await apply_stealth(page)
         await page.goto(DOUYIN_URL, wait_until="domcontentloaded")
         await _open_login(page)
         print("请在浏览器中扫码登录。登录完成并看到抖音首页后，回到终端按 Enter。")
@@ -39,7 +61,7 @@ async def login() -> None:
         await browser.close()
         Path("storage-state.json.tmp").replace("storage-state.json")
         print("登录状态已保存到 storage-state.json")
-        print("把该文件的完整内容填进 GitHub Secret DOUYIN_STORAGE_STATE 即可（比纯 Cookie 更稳）。")
+        print("本地运行时程序会自动优先使用它；也可以整份填进 GitHub Secret DOUYIN_STORAGE_STATE。")
 
 
 async def _open_login(page) -> None:
